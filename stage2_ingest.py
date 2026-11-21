@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import site
 import subprocess
 import sys
@@ -60,6 +61,13 @@ def extract_vod_id(vod_url: str) -> str:
     return match.group(1)
 
 
+def _normalize_test_minutes(test_minutes):
+    if test_minutes is None or test_minutes == "":
+        return None
+    val = int(test_minutes)
+    return val if val > 0 else None
+
+
 def _prepare_checkpoint(vod_dir: str, vod_id: str, vod_url: str, test_minutes):
     meta_path = os.path.join(vod_dir, "meta.json")
     old_meta = None
@@ -68,11 +76,14 @@ def _prepare_checkpoint(vod_dir: str, vod_id: str, vod_url: str, test_minutes):
             old_meta = json.load(f)
 
     if old_meta and old_meta.get("test_minutes") != test_minutes:
-        for fname in ["chat.json", "audio.mp3", "hype_timeline.json", "transcript.json"]:
+        for fname in ["chat.json", "audio.mp3", "hype_timeline.json", "transcript.json", "clips_manifest.json"]:
             fpath = os.path.join(vod_dir, fname)
             if os.path.exists(fpath):
                 os.remove(fpath)
-        log("🔄 تغيّرت مدة البث المطلوبة — تم تصفير الملفات القديمة للبدء على نظافة")
+        clips_dir = os.path.join(vod_dir, "clips")
+        if os.path.isdir(clips_dir):
+            shutil.rmtree(clips_dir, ignore_errors=True)
+        log("🔄 تم التحويل من وضع التجربة إلى البث الكامل — تم تصفير ملفات التجربة للبدء على نظافة")
 
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -100,8 +111,8 @@ def download_chat(vod_id: str, out_path: str, test_minutes=None):
         "Content-Type": "application/json",
     }
     max_sec = test_minutes * 60 if test_minutes else None
-    max_pages = 40 if test_minutes else 600
-    time_budget = 30 if test_minutes else 120
+    max_pages = 40 if test_minutes else 2500
+    time_budget = 30 if test_minutes else 180
 
     messages = []
     seen_cursors = set()
@@ -132,7 +143,7 @@ def download_chat(vod_id: str, out_path: str, test_minutes=None):
         }]
 
         try:
-            resp = requests.post(TWITCH_GQL_URL, headers=headers, json=payload, timeout=(5, 10))
+            resp = requests.post(TWITCH_GQL_URL, headers=headers, json=payload, timeout=(5, 12))
             resp.raise_for_status()
             data = resp.json()
             video = data[0].get("data", {}).get("video")
@@ -170,7 +181,7 @@ def download_chat(vod_id: str, out_path: str, test_minutes=None):
                 })
 
         pages += 1
-        if pages % 5 == 0:
+        if pages % 20 == 0:
             log(f"   ... تم سحب {len(messages)} رسالة (وصلنا للدقيقة {last_offset / 60:.1f})")
 
         page_info = comments.get("pageInfo", {})
@@ -209,6 +220,8 @@ def download_audio(vod_url: str, out_mp3: str, test_minutes=None):
         m, s = divmod(rem, 60)
         cmd += ["--download-sections", f"*00:00:00-{h:02d}:{m:02d}:{s:02d}"]
         log(f"   🧪 وضع التجربة السريعة: أول {test_minutes} دقائق فقط")
+    else:
+        log("   🚀 وضع البث الكامل — جاري سحب صوت البث من بدايته لنهايته...")
 
     cmd.append(vod_url)
     subprocess.run(cmd, check=True)
@@ -293,6 +306,7 @@ def transcribe_audio(audio_path: str, out_path: str):
     )
 
     segments_data = []
+    log_step = 10 if total_dur > 3600 else 5
     last_log_min = 0
 
     for seg in segments_gen:
@@ -316,7 +330,7 @@ def transcribe_audio(audio_path: str, out_path: str):
             })
 
         cur_min = int(seg.end // 60)
-        if cur_min >= last_log_min + 2:
+        if cur_min >= last_log_min + log_step:
             last_log_min = cur_min
             log(f"   ... تم تفريغ {cur_min} دقيقة من أصل {total_dur / 60:.1f} دقيقة")
 
@@ -331,11 +345,12 @@ def transcribe_audio(audio_path: str, out_path: str):
     gc.collect()
 
     elapsed = time.time() - t0
-    log(f"✅ اكتمل التفريغ! ({len(segments_data)} جملة في {elapsed:.1f} ثانية)")
+    log(f"✅ اكتمل التفريغ! ({len(segments_data)} جملة في {elapsed / 60:.1f} دقيقة)")
     return segments_data
 
 
 def run_stage2(vod_url: str, drive_root: str, test_minutes=None):
+    test_minutes = _normalize_test_minutes(test_minutes)
     vod_id = extract_vod_id(vod_url)
     vod_dir = os.path.join(drive_root, "vods", vod_id)
     os.makedirs(vod_dir, exist_ok=True)
@@ -369,9 +384,6 @@ def run_stage2(vod_url: str, drive_root: str, test_minutes=None):
 
     with open(transcript_path, "r", encoding="utf-8") as f:
         tr = json.load(f)
-    log("\n📝 عينة من أول 5 جمل مفرّغة:")
-    for seg in tr["segments"][:5]:
-        log(f"   [{seg['start']:>6.1f}s - {seg['end']:>6.1f}s] {seg['text']}")
-
-    log(f"\n🎉 المرحلة 2 جاهزة ومحفوظة في: {vod_dir}")
+    log(f"\n🎉 المرحلة 2 جاهزة! مدة البث المفرّغ: {tr['duration'] / 60:.1f} دقيقة ({len(tr['segments'])} جملة)")
+    log(f"📁 المسار: {vod_dir}")
     return vod_dir
