@@ -1,16 +1,16 @@
+import concurrent.futures
 import json
 import os
 import re
 import subprocess
+import time
 from google import genai
 from google.genai import types
 
-# قائمة الموديلات بالأولوية (تشتغل تلقائياً على الفئة المجانية بدون مشاكل)
-GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
+PREFERRED_MODELS = [
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
 
 
@@ -69,13 +69,11 @@ def load_memory_context(drive_root: str) -> str:
 
 
 def build_stream_digest(transcript: dict, hype_timeline: list, chat_messages: list) -> str:
-    # ربط نوافذ الحماس العالية بالثواني
     hype_by_bucket = {}
     for item in hype_timeline:
         bucket = int(item["start"] // 10)
         hype_by_bucket[bucket] = item
 
-    # تجميع عينات من الشات لكل نافذة 10 ثواني
     chat_by_bucket = {}
     for msg in chat_messages:
         bucket = int(msg["t"] // 10)
@@ -105,28 +103,58 @@ def build_stream_digest(transcript: dict, hype_timeline: list, chat_messages: li
     return "\n".join(lines)
 
 
-def call_gemini_json(api_key: str, prompt: str) -> dict:
+def _discover_extra_flash_models(client) -> list:
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "flash" in name.lower() and ("generateContent" in actions or not actions):
+                if name not in PREFERRED_MODELS:
+                    found.append(name)
+    except Exception:
+        pass
+    return found[:3]
+
+
+def _request_once(client, model_name: str, prompt: str) -> str:
+    resp = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.4,
+        ),
+    )
+    return (resp.text or "").strip()
+
+
+def call_gemini_json(api_key: str, prompt: str, timeout_sec: int = 60) -> dict:
     client = genai.Client(api_key=api_key)
+    candidates = list(PREFERRED_MODELS) + _discover_extra_flash_models(client)
     last_err = None
 
-    for model_name in GEMINI_MODELS:
+    for model_name in candidates:
+        t0 = time.time()
+        log(f"🧠 جاري استشارة الذكاء الاصطناعي ({model_name}) — مهلة الانتظار {timeout_sec} ثانية...")
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_request_once, client, model_name, prompt)
         try:
-            log(f"🧠 جاري استشارة الذكاء الاصطناعي ({model_name}) لاختيار أفضل اللقطات...")
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
-            raw = (resp.text or "").strip()
+            raw = future.result(timeout=timeout_sec)
+            pool.shutdown(wait=False)
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             parsed = json.loads(raw)
-            log(f"✅ تم اختيار اللقطات بنجاح عبر {model_name}")
+            log(f"✅ تم اختيار اللقطات بنجاح عبر {model_name} في {time.time() - t0:.1f} ثانية")
             return parsed
+        except concurrent.futures.TimeoutError:
+            pool.shutdown(wait=False)
+            log(f"⏱️ الموديل {model_name} تجاوز {timeout_sec} ثانية بدون رد — نجرب البديل...")
+            last_err = TimeoutError(f"{model_name} timed out")
         except Exception as e:
-            log(f"⚠️ الموديل {model_name} ما استجاب ({e}) — نجرب البديل...")
+            pool.shutdown(wait=False)
+            short_err = str(e).splitlines()[0][:180]
+            log(f"⚠️ الموديل {model_name} ما استجاب ({short_err}) — نجرب البديل...")
             last_err = e
 
     raise RuntimeError(f"❌ فشلت جميع موديلات Gemini: {last_err}")
@@ -161,6 +189,9 @@ def select_clips(
         chat_messages = json.load(f)
 
     duration = float(transcript.get("duration", 0))
+    segs_count = len(transcript.get("segments", []))
+    log(f"📄 جاري قراءة التفريغ ({segs_count} جملة / {duration / 60:.1f} دقيقة)...")
+
     digest = build_stream_digest(transcript, hype_timeline, chat_messages)
     memory_ctx = load_memory_context(drive_root)
 
@@ -222,7 +253,6 @@ def select_clips(
         if en - st < 8.0:
             continue
 
-        # فحص عدم التداخل مع اللقطات القديمة أو الجديدة
         overlaps = any(not (en <= a or st >= b) for a, b in existing_ranges)
         if overlaps:
             continue
@@ -272,7 +302,6 @@ def generate_clip_srt(
                         "e": min(clip_dur, w["e"] - clip_start),
                     })
         else:
-            # احتياط لو الجملة ما فيها توقيت كلمات
             tokens = seg["text"].split()
             if tokens:
                 s0 = max(clip_start, seg["start"])
@@ -285,7 +314,6 @@ def generate_clip_srt(
                         "e": min(clip_dur, (s0 + (idx + 1) * step) - clip_start),
                     })
 
-    # تجميع الكلمات لأسطر قصيرة ديناميكية (ستايل تيك توك و CapCut)
     entries = []
     buf = []
 
@@ -334,11 +362,12 @@ def cut_clip_video(vod_url: str, start: float, end: float, out_mp4: str):
         "--download-sections", section,
         "--force-keyframes-at-cuts",
         "--no-playlist",
-        "-q", "--no-warnings",
+        "--no-warnings",
+        "-q",
         "-o", out_mp4,
         vod_url,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=240)
 
 
 def run_stage3(
@@ -403,6 +432,7 @@ def run_stage3(
             f"({sec_to_hms(clip['start'])} → {sec_to_hms(clip['end'])} | {clip['duration']}ث | تقييم {clip['virality_score']}/10)"
         )
         log(f"    💡 السبب: {clip['reason']}")
+        log("    ⏳ جاري تحميل وقصّ الفيديو من تويتش (تاخذ 15-40 ثانية)...")
 
         try:
             cut_clip_video(vod_url, clip["start"], clip["end"], mp4_path)
