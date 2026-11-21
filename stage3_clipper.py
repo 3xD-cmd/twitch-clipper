@@ -2,16 +2,20 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from google import genai
 from google.genai import types
 
 PREFERRED_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
 ]
+
+EXCLUDED_MODEL_KEYWORDS = ("tts", "image", "audio", "embedding", "live", "veo", "imagen", "lyria")
 
 
 def log(msg: str):
@@ -51,7 +55,7 @@ def load_memory_context(drive_root: str) -> str:
         with open(rules_path, "r", encoding="utf-8") as f:
             rules = f.read().strip()
         if rules:
-            parts.append(f"### قواعد ذوق الممنتج (مهم جداً الالتزام بها):\n{rules}")
+            parts.append(f"### قواعد ذوق الممنتج المتعلَّمة (التزم بها بدقة):\n{rules}")
 
     if os.path.exists(history_path):
         with open(history_path, "r", encoding="utf-8") as f:
@@ -59,20 +63,23 @@ def load_memory_context(drive_root: str) -> str:
         liked = [h for h in history if h.get("rating") == "liked"][-6:]
         disliked = [h for h in history if h.get("rating") == "disliked"][-6:]
         if liked:
-            lines = [f"- 👍 {x.get('title')} ({x.get('category', '')}) — ملاحظة: {x.get('note', 'ممتازة')}" for x in liked]
+            lines = [
+                f"- 👍 {x.get('title')} ({x.get('category', '')}) — ملاحظة: {x.get('note', 'ممتازة')}"
+                for x in liked
+            ]
             parts.append("### أمثلة لقطات أعجبت الممنتج مؤخراً:\n" + "\n".join(lines))
         if disliked:
-            lines = [f"- 👎 {x.get('title')} ({x.get('category', '')}) — سبب الرفض: {x.get('note', 'ما تنفع')}" for x in disliked]
+            lines = [
+                f"- 👎 {x.get('title')} ({x.get('category', '')}) — سبب الرفض: {x.get('note', 'ما تنفع')}"
+                for x in disliked
+            ]
             parts.append("### أمثلة لقطات رفضها الممنتج (تجنب مثلها):\n" + "\n".join(lines))
 
     return "\n\n".join(parts)
 
 
 def build_stream_digest(transcript: dict, hype_timeline: list, chat_messages: list) -> str:
-    hype_by_bucket = {}
-    for item in hype_timeline:
-        bucket = int(item["start"] // 10)
-        hype_by_bucket[bucket] = item
+    hype_by_bucket = {int(item["start"] // 10): item for item in hype_timeline}
 
     chat_by_bucket = {}
     for msg in chat_messages:
@@ -87,8 +94,11 @@ def build_stream_digest(transcript: dict, hype_timeline: list, chat_messages: li
         bucket = int(st // 10)
         h_info = hype_by_bucket.get(bucket, {})
         tags = []
-        if h_info.get("audio", 0) >= 0.75:
-            tags.append("🔥صوت_عالي")
+        audio_lvl = h_info.get("audio", 0)
+        if audio_lvl >= 0.85:
+            tags.append("🔥صراخ_أو_ضحك_عالي")
+        elif audio_lvl >= 0.65:
+            tags.append("⚡نبرة_حماس_أو_توتر")
         if h_info.get("chat_msgs", 0) >= 3:
             tags.append(f"💬شات({h_info['chat_msgs']})")
 
@@ -108,10 +118,13 @@ def _discover_extra_flash_models(client) -> list:
     try:
         for m in client.models.list():
             name = (getattr(m, "name", "") or "").replace("models/", "")
-            actions = getattr(m, "supported_actions", None) or []
-            if "flash" in name.lower() and ("generateContent" in actions or not actions):
-                if name not in PREFERRED_MODELS:
-                    found.append(name)
+            low = name.lower()
+            if "flash" not in low:
+                continue
+            if any(bad in low for bad in EXCLUDED_MODEL_KEYWORDS):
+                continue
+            if name not in PREFERRED_MODELS:
+                found.append(name)
     except Exception:
         pass
     return found[:3]
@@ -123,20 +136,20 @@ def _request_once(client, model_name: str, prompt: str) -> str:
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            temperature=0.4,
+            temperature=0.35,
         ),
     )
     return (resp.text or "").strip()
 
 
-def call_gemini_json(api_key: str, prompt: str, timeout_sec: int = 60) -> dict:
+def call_gemini_json(api_key: str, prompt: str, timeout_sec: int = 90) -> dict:
     client = genai.Client(api_key=api_key)
     candidates = list(PREFERRED_MODELS) + _discover_extra_flash_models(client)
     last_err = None
 
     for model_name in candidates:
         t0 = time.time()
-        log(f"🧠 جاري استشارة الذكاء الاصطناعي ({model_name}) — مهلة الانتظار {timeout_sec} ثانية...")
+        log(f"🧠 جاري تحليل البث واختيار اللقطات عبر ({model_name})...")
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(_request_once, client, model_name, prompt)
         try:
@@ -149,7 +162,7 @@ def call_gemini_json(api_key: str, prompt: str, timeout_sec: int = 60) -> dict:
             return parsed
         except concurrent.futures.TimeoutError:
             pool.shutdown(wait=False)
-            log(f"⏱️ الموديل {model_name} تجاوز {timeout_sec} ثانية بدون رد — نجرب البديل...")
+            log(f"⏱️ الموديل {model_name} تجاوز {timeout_sec} ثانية — نجرب البديل...")
             last_err = TimeoutError(f"{model_name} timed out")
         except Exception as e:
             pool.shutdown(wait=False)
@@ -176,9 +189,6 @@ def select_clips(
     api_key: str,
     vod_dir: str,
     drive_root: str,
-    num_clips: int = 4,
-    min_sec: int = 18,
-    max_sec: int = 60,
     existing_clips: list = None,
 ) -> list:
     with open(os.path.join(vod_dir, "transcript.json"), "r", encoding="utf-8") as f:
@@ -199,24 +209,26 @@ def select_clips(
     if existing_clips:
         ranges = [f"- من {c['start']}s إلى {c['end']}s ({c['title']})" for c in existing_clips]
         exclude_text = (
-            "\n### تنبيه مهم — لقطات تم قصّها مسبقاً (ممنوع تكرارها أو التداخل معها):\n"
+            "\n### لقطات تم قصّها مسبقاً (ممنوع تكرارها أو التداخل معها — هات لقطات جديدة مختلفة تماماً):\n"
             + "\n".join(ranges)
         )
 
-    prompt = f"""أنت ممنتج ومخرج محتوى محترف متخصص في تحويل بثوث تويتش العربية (قيمينق وسوالف) إلى مقاطع TikTok و Reels فيرال تجيب مشاهدات عالية.
+    prompt = f"""أنت مخرج وممنتج محتوى محترف متخصص في بثوث تويتش العربية (قيمينق وسوالف) لتحويلها إلى مقاطع TikTok و Reels تجيب مشاهدات وتفاعل قوي.
 
-أمامك نص بث كامل مع التوقيت بالثواني، وعلامات ارتفاع الصوت (🔥صوت_عالي) وتفاعل الشات (💬شات).
-مدة البث المتاحة: {duration:.1f} ثانية.
+أمامك نص البث مع التوقيت بالثواني، وعلامات نبرة الصوت (🔥صراخ_أو_ضحك_عالي، ⚡نبرة_حماس_أو_توتر) وتفاعل الشات (💬شات).
+مدة الجزء المتاح من البث: {duration:.1f} ثانية.
 
-المطلوب:
-اختر أفضل {num_clips} لقطات مستقلة تصلح للقص والنشر في TikTok / Reels.
-
-شروط الاختيار والقصّ الصارمة:
-1. مدة كل لقطة تكون بين {min_sec} ثانية و {max_sec} ثانية (مرونة بسيطة مسموحة فقط لإكمال الجملة).
-2. ممنوع تبدأ اللقطة من نص جملة أو تنهيها قبل ما تخلص القفلة/الضحكة/ردة الفعل.
-3. ركّز على: الذبّات القوية، الضحك، المواقف المحرجة، الطقطقة مع الشات، حماس أو عصبية القيمينق، السوالف اللي لها خطاف (Hook) في أول 3 ثوانٍ.
-4. تجنب المقاطع الميتة أو السكوت الطويل أو الكلام التقني الممل عن إعدادات البث (إلا لو صار فيه موقف مضحك).
-5. ممنوع تداخل الأوقات بين اللقطات المختارة.
+### مهمتك وحريتك الكاملة:
+1. **لا يوجد عدد محدد للقطات ولا مدة محددة:** أنت حر تماماً! استخرج فقط اللقطات التي تستاهل فعلاً النشر (لو في هذا الجزء لقطتان أسطوريتان فقط هات ثنتين، ولو فيه 10 لقطات رهيبة هاتهم كلهم — الجودة أهم من العدد، وممنوع الحشو).
+2. **السياق الكامل (Full Context):** خذ اللقطة كاملة من بداية الموقف/السالفة حتى نهاية القفلة أو الضحكة أو ردة الفعل!
+   - لو كانت لحظة ضحك أو صراخ أو خوف سريعة: ممكن تكون 12 إلى 30 ثانية.
+   - لو كانت سالفة ممتعة أو موقف متصاعد: عادي جداً تمتد لدقيقة أو دقيقتين أو أكثر طالما فيها متعة وما فيها ملل.
+   - ممنوع منعاً باتاً تبدأ اللقطة من نص جملة أو تقصّها قبل ما تخلص ردة الفعل!
+3. **أسلوب الستريمر الخاص (مهم جداً):**
+   - ركّز على اللحظات اللي فيها: **ضحك، صراخ، توتر وخوف، عفوية، طقطقة مع الشات، أو سالفة حلوة ومضحكة**.
+   - **انتبه لموضوع التشتت:** الستريمر أحياناً تتشتت بسرعة وتدخل أكثر من موضوع في بعض؛ لو فتحت سالفة وتشتتت ثوانٍ بسيطة بتعليق على الشات أو اللعبة ثم رجعت كملت سالفتها، لا تقطع السالفة قبل ما تكمل! أما لو انتقلت من سالفة حلوة إلى موضوع ثاني مختلف ورهيب، فافصل كل سالفة/موقف مستقل في لقطته الخاصة مع سياقه الكامل.
+4. **ممنوع اختيار لحظات اللعب الصامت أو الكلام الإنجليزي الصادر من اللعبة فقط بدون تفاعل ممتع من الستريمر.**
+5. ممنوع تداخل الأوقات بين اللقطات.
 {memory_ctx}
 {exclude_text}
 
@@ -224,12 +236,12 @@ def select_clips(
 {{
   "clips": [
     {{
-      "title": "عنوان عربي قصير ومشوق (2 إلى 5 كلمات)",
+      "title": "عنوان عربي قصير وجذاب (2 إلى 5 كلمات)",
       "start": 12.5,
-      "end": 48.0,
-      "category": "ضحك أو سالفة أو قيمينق أو تفاعل_شات أو موقف_محرج",
-      "virality_score": 8,
-      "reason": "سبب اختيار اللقطة في سطر واحد"
+      "end": 58.0,
+      "category": "ضحك أو صراخ_وتوتر أو سالفة أو تفاعل_شات أو قيمينق",
+      "virality_score": 9,
+      "reason": "ليش اللقطة رهيبة ووش السياق والقفلة فيها"
     }}
   ]
 }}
@@ -250,7 +262,7 @@ def select_clips(
         except (KeyError, TypeError, ValueError):
             continue
 
-        if en - st < 8.0:
+        if en - st < 6.0:
             continue
 
         overlaps = any(not (en <= a or st >= b) for a, b in existing_ranges)
@@ -265,7 +277,7 @@ def select_clips(
             "end": en,
             "duration": round(en - st, 2),
             "category": str(item.get("category", "منوع")).strip(),
-            "virality_score": int(item.get("virality_score", 7)),
+            "virality_score": int(item.get("virality_score", 8)),
             "reason": str(item.get("reason", "")).strip(),
             "metrics": metrics,
             "rating": "pending",
@@ -280,9 +292,6 @@ def generate_clip_srt(
     clip_start: float,
     clip_end: float,
     out_srt: str,
-    max_words: int = 3,
-    max_chars: int = 24,
-    pause_threshold: float = 0.45,
 ) -> int:
     clip_dur = clip_end - clip_start
     words = []
@@ -314,6 +323,7 @@ def generate_clip_srt(
                         "e": min(clip_dur, (s0 + (idx + 1) * step) - clip_start),
                     })
 
+    # تقطيع ذكي تلقائي لستايل التيك توك يحترم الوقفات وعلامات الترقيم
     entries = []
     buf = []
 
@@ -329,14 +339,17 @@ def generate_clip_srt(
         buf.clear()
 
     for w in words:
-        if not w["w"]:
+        tok = w["w"]
+        if not tok:
             continue
         if buf:
             gap = w["s"] - buf[-1]["e"]
-            projected_len = len(" ".join(x["w"] for x in buf)) + 1 + len(w["w"])
-            if len(buf) >= max_words or projected_len > max_chars or gap > pause_threshold:
+            projected_len = len(" ".join(x["w"] for x in buf)) + 1 + len(tok)
+            if gap > 0.38 or projected_len > 24 or len(buf) >= 4:
                 flush()
         buf.append(w)
+        if tok.endswith(("؟", "!", ".", "،", "?")):
+            flush()
     flush()
 
     srt_blocks = []
@@ -349,35 +362,81 @@ def generate_clip_srt(
     return len(entries)
 
 
-def cut_clip_video(vod_url: str, start: float, end: float, out_mp4: str):
-    if os.path.exists(out_mp4):
-        os.remove(out_mp4)
-
-    section = f"*{sec_to_hms(start)}-{sec_to_hms(end)}"
+def resolve_stream_urls(vod_url: str) -> list:
+    log("🔗 جاري استخراج رابط البث المباشر للقص السريع...")
     cmd = [
         "yt-dlp",
-        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "--merge-output-format", "mp4",
-        "--remux-video", "mp4",
-        "--download-sections", section,
-        "--force-keyframes-at-cuts",
+        "-f", "best[height<=1080]/bestvideo[height<=1080]+bestaudio/best",
+        "-g",
         "--no-playlist",
         "--no-warnings",
-        "-q",
-        "-o", out_mp4,
         vod_url,
     ]
-    subprocess.run(cmd, check=True, timeout=240)
+    out = subprocess.check_output(cmd, text=True, timeout=60).strip()
+    urls = [line.strip() for line in out.splitlines() if line.strip()]
+    if not urls:
+        raise RuntimeError("تعذر استخراج رابط البث من تويتش")
+    return urls
+
+
+def cut_clip_video(stream_urls: list, start: float, end: float, out_mp4: str):
+    duration = max(1.0, end - start)
+    local_tmp = os.path.join("/tmp", os.path.basename(out_mp4))
+    if os.path.exists(local_tmp):
+        os.remove(local_tmp)
+
+    input_args = []
+    for u in stream_urls[:2]:
+        input_args += ["-ss", f"{start:.2f}", "-i", u]
+
+    # نجرب كرت الشاشة T4 أولاً (صاروخي)، ولو ما توفر يتحول تلقائياً لـ libx264 سريع
+    encoders = [
+        ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21"],
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"],
+    ]
+
+    last_err = ""
+    success = False
+    for enc in encoders:
+        cmd = (
+            ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+            + input_args
+            + ["-t", f"{duration:.2f}"]
+            + enc
+            + ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", local_tmp]
+        )
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+        if res.returncode == 0 and os.path.exists(local_tmp) and os.path.getsize(local_tmp) > 10_000:
+            success = True
+            break
+        last_err = res.stderr.strip().splitlines()[-1] if res.stderr.strip() else f"exit code {res.returncode}"
+
+    if not success:
+        raise RuntimeError(f"فشل FFmpeg أثناء القص: {last_err}")
+
+    if os.path.exists(out_mp4):
+        os.remove(out_mp4)
+    shutil.copy2(local_tmp, out_mp4)
+    os.remove(local_tmp)
+
+
+def _cleanup_broken_parts(clips_dir: str):
+    removed = 0
+    for fname in os.listdir(clips_dir):
+        if fname.endswith(".part"):
+            try:
+                os.remove(os.path.join(clips_dir, fname))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log(f"🧹 تم تنظيف {removed} ملفات .part قديمة وغير مكتملة من مجلد clips")
 
 
 def run_stage3(
     vod_dir: str,
     drive_root: str,
     api_key: str,
-    num_clips: int = 4,
-    min_sec: int = 18,
-    max_sec: int = 60,
-    words_per_line: int = 3,
     extra_clips: bool = False,
 ):
     meta_path = os.path.join(vod_dir, "meta.json")
@@ -385,6 +444,7 @@ def run_stage3(
     manifest_path = os.path.join(vod_dir, "clips_manifest.json")
     clips_dir = os.path.join(vod_dir, "clips")
     os.makedirs(clips_dir, exist_ok=True)
+    _cleanup_broken_parts(clips_dir)
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -399,26 +459,24 @@ def run_stage3(
             existing_clips = json.load(f)
 
     if existing_clips and not extra_clips:
-        log(f"ℹ️ يوجد بالفعل {len(existing_clips)} لقطة مقصوصة لهذا البث.")
-        log("   إذا تبي لقطات زيادة من نفس البث، فعّل خيار EXTRA_CLIPS = True وشغّل الخلية.")
+        log(f"ℹ️ يوجد بالفعل {len(existing_clips)} لقطة جاهزة لهذا البث.")
+        log("   إذا تبي لقطات إضافية من نفس البث، فعّل خيار EXTRA_CLIPS وشغّل الخلية.")
         return existing_clips
 
     new_clips = select_clips(
         api_key=api_key,
         vod_dir=vod_dir,
         drive_root=drive_root,
-        num_clips=num_clips,
-        min_sec=min_sec,
-        max_sec=max_sec,
         existing_clips=existing_clips,
     )
 
     if not new_clips:
-        log("⚠️ ما لقى الذكاء الاصطناعي لقطات جديدة مطابقة للشروط في هذا الجزء.")
+        log("⚠️ ما لقى الذكاء الاصطناعي لقطات جديدة تستاهل القص في هذا الجزء.")
         return existing_clips
 
+    stream_urls = resolve_stream_urls(vod_url)
     start_index = len(existing_clips) + 1
-    log(f"\n🎬 تم اختيار {len(new_clips)} لقطة! جاري القصّ الجراحي وتوليد ملفات الـ .srt المنفصلة...\n")
+    log(f"\n🎬 تم اختيار {len(new_clips)} لقطة! جاري القصّ السريع وتوليد ملفات الـ .srt المنفصلة...\n")
 
     for offset, clip in enumerate(new_clips):
         clip_num = start_index + offset
@@ -432,28 +490,22 @@ def run_stage3(
             f"({sec_to_hms(clip['start'])} → {sec_to_hms(clip['end'])} | {clip['duration']}ث | تقييم {clip['virality_score']}/10)"
         )
         log(f"    💡 السبب: {clip['reason']}")
-        log("    ⏳ جاري تحميل وقصّ الفيديو من تويتش (تاخذ 15-40 ثانية)...")
 
+        t0 = time.time()
         try:
-            cut_clip_video(vod_url, clip["start"], clip["end"], mp4_path)
-            sub_count = generate_clip_srt(
-                transcript,
-                clip["start"],
-                clip["end"],
-                srt_path,
-                max_words=words_per_line,
-            )
+            cut_clip_video(stream_urls, clip["start"], clip["end"], mp4_path)
+            sub_count = generate_clip_srt(transcript, clip["start"], clip["end"], srt_path)
             size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
             clip["id"] = clip_num
             clip["video_path"] = mp4_path
             clip["srt_path"] = srt_path
             existing_clips.append(clip)
-            log(f"    ✅ جاهز! الفيديو ({size_mb:.1f} MB) + ملف سبتايتل منفصل ({sub_count} سطر)\n")
+            log(f"    ✅ جاهز خلال {time.time() - t0:.1f}ث! الفيديو ({size_mb:.1f} MB) + ملف .srt منفصل ({sub_count} سطر)\n")
         except Exception as e:
             log(f"    ❌ فشل قص اللقطة رقم {clip_num}: {e}\n")
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(existing_clips, f, ensure_ascii=False, indent=2)
 
-    log(f"🎉 خلصنا! كل اللقطات وملفات الـ .srt محفوظة في Google Drive داخل:\n   {clips_dir}")
+    log(f"🎉 خلصنا! افتح درايفك وشوف اللقطات + ملفات الـ .srt جاهزة داخل:\n   {clips_dir}")
     return existing_clips
