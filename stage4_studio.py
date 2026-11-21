@@ -10,9 +10,10 @@ QUICK_TAGS = [
     "سالفة حلوة وكاملة السياق",
     "التوتر والخوف مضحك",
     "طقطقة رهيبة مع الشات",
+    "القص الذكي (Jump Cuts) مضبوط",
     "القصّ بدأ متأخر أو انقطع بدري",
+    "فيه حشو أو صمت ما انحذف",
     "تشتتت وضاعت السالفة",
-    "طويلة ومملة / فيها سكوت",
     "كلام عادي ما يستاهل نشر",
 ]
 
@@ -62,7 +63,7 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
     def get_choices():
         clips = get_clips()
         return [
-            f"#{c['id']:02d} | {c['title']} [{_rating_badge(c.get('rating', 'pending'))}]"
+            f"#{c['id']:02d} | {c['title']} ({c['duration']}ث) [{_rating_badge(c.get('rating', 'pending'))}]"
             for c in clips
         ]
 
@@ -95,12 +96,22 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
             with open(srt_path, "r", encoding="utf-8") as f:
                 srt_text = f.read()
 
+        segs = clip.get("segments") or [[clip["start"], clip["end"]]]
+        removed_sec = float(clip.get("removed_sec", 0))
+        cut_summary = (
+            f"{len(segs)} أجزاء مدمجة (حُذف {removed_sec:.1f}ث حشو وصمت)"
+            if len(segs) > 1 or removed_sec > 0.5
+            else "لقطة كاملة متصلة بدون تقطيع"
+        )
+        cut_notes = clip.get("cut_notes", "")
+
         info_md = (
             f"### 🎬 {clip['title']}\n"
-            f"- **التوقيت في البث:** `{sec_to_hms(clip['start'])}` ← `{sec_to_hms(clip['end'])}` (**المدة:** {clip['duration']} ثانية)\n"
-            f"- **التصنيف:** `{clip.get('category', 'منوع')}` | **تقييم الذكاء الاصطناعي:** `{clip.get('virality_score', '-')}/10`\n"
+            f"- **المدة الصافية:** `{clip['duration']} ثانية` | **النطاق الأصلي:** `{sec_to_hms(clip['start'])}` ← `{sec_to_hms(clip['end'])}`\n"
+            f"- **القصّ الذكي (Jump Cuts):** {cut_summary}" + (f" — *{cut_notes}*" if cut_notes else "") + "\n"
+            f"- **التصنيف:** `{clip.get('category', 'منوع')}` | **تقييم الناقد:** `{clip.get('virality_score', '-')}/10`\n"
             f"- **إيقاع كلام الستريمر:** {_pace_label(float(clip.get('avg_wps', 0)))}\n"
-            f"- **ليش اختارها الذكاء الاصطناعي:** {clip.get('reason', '-')}"
+            f"- **ليش اختارها:** {clip.get('reason', '-')}"
         )
 
         rating_val = _rating_badge(clip.get("rating", "pending"))
@@ -140,7 +151,6 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
         clips[idx] = clip
         _save_json(manifest_path, clips)
 
-        # تحديث الذاكرة الدائمة على Google Drive
         history = _load_json(history_path, [])
         entry_key = f"{vod_id}_{clip['id']}"
         history = [h for h in history if h.get("key") != entry_key]
@@ -153,6 +163,7 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
                 "title": clip["title"],
                 "category": clip.get("category", ""),
                 "duration": clip.get("duration", 0),
+                "removed_sec": clip.get("removed_sec", 0),
                 "avg_wps": clip.get("avg_wps", 0),
                 "metrics": clip.get("metrics", {}),
                 "excerpt": clip.get("excerpt", ""),
@@ -216,12 +227,19 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
 اكتب دليلاً عملياً مختصراً ومرتباً بالعربية (نقاط واضحة ومباشرة بحد أقصى 12 قاعدة) مقسّماً إلى:
 1. **وش يحب الممنتج (نقاط القوة):**
 2. **وش يرفض الممنتج (الأغلاط الممنوعة):**
-3. **أسلوب الستريمر والتعامل مع تشتتها وطول اللقطة:**
+3. **أسلوب الستريمر والقصّ الذكي (Jump Cuts) وطول اللقطة:**
 
 اجعل القواعد دقيقة جداً وقابلة للتطبيق المباشر عند اختيار وقصّ لقطات البث القادم.
 """
         try:
-            new_rules = call_gemini_text(api_key, prompt, json_mode=False, timeout_sec=90).strip()
+            new_rules = call_gemini_text(
+                api_key,
+                prompt,
+                json_mode=False,
+                timeout_sec=100,
+                prefer_pro=True,
+                thinking_budget=1024,
+            ).strip()
             with open(rules_path, "w", encoding="utf-8") as f:
                 f.write(new_rules + "\n")
             return new_rules, f"🧠 تم التحديث بنجاح! الذكاء الاصطناعي حلّل {len(history)} تقييم وحفظ قواعد ذوقك الجديدة."
@@ -230,10 +248,7 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
 
     def export_zip(only_liked: bool):
         clips = get_clips()
-        if only_liked:
-            target = [c for c in clips if c.get("rating") == "liked"]
-        else:
-            target = clips
+        target = [c for c in clips if c.get("rating") == "liked"] if only_liked else clips
 
         if not target:
             return None, "⚠️ ما فيه لقطات مطابقة للتصدير (تأكد إنك عطيت 👍 على اللقطات اللي تبيها)."
@@ -295,7 +310,7 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
 
             note_input = gr.Textbox(
                 label="ليش عجبتك أو ليش رفضتها؟ (اكتب بكلامك العادي)",
-                placeholder="مثال: أحب لما تتوتر وتدور اللي كتب في الشات / القصّة انقطعت قبل ما تكمل السالفة...",
+                placeholder="مثال: قصّة النص رهيبة وشالت التشتت / لسه فيه سكون في الوسط...",
                 rtl=True,
             )
             save_fb_btn = gr.Button("✅ حفظ التقييم في ذاكرة الذكاء الاصطناعي", variant="primary")
@@ -304,7 +319,7 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
         with gr.Tab("🧠 دماغ الذكاء الاصطناعي (قواعد ذوقك)"):
             gr.Markdown(
                 "بعد ما تقيّم اللقطات في التبويب الأول، اضغط الزر تحت عشان الذكاء الاصطناعي يراجع كل تقييماتك "
-                "ويحدّث قواعد اختيار وقصّ اللقطات تلقائياً للبث الجاي (أو لما تطلب لقطات زيادة من نفس البث)."
+                "ويحدّث قواعد اختيار وقصّ اللقطات تلقائياً للبث الجاي."
             )
             train_btn = gr.Button("🚀 حدّث قواعد الذكاء الاصطناعي من تقييماتي الآن", variant="primary")
             train_status = gr.Markdown()
@@ -322,7 +337,6 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
             zip_status = gr.Markdown()
             zip_file = gr.File(label="اضغط لتحميل الملف لجهازك")
 
-        # ربط الأحداث
         clip_dropdown.change(
             fn=load_clip_ui,
             inputs=[clip_dropdown],
@@ -344,3 +358,6 @@ def launch_studio(vod_dir: str, drive_root: str, api_key: str):
         zip_btn.click(fn=export_zip, inputs=[only_liked_cb], outputs=[zip_file, zip_status])
 
     demo.launch(share=True, allowed_paths=[drive_root, "/tmp"])
+
+
+# === END OF stage4_studio.py ===
