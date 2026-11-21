@@ -1,8 +1,12 @@
+import ctypes
 import gc
+import glob
 import json
 import os
 import re
+import site
 import subprocess
+import sys
 import time
 import numpy as np
 import requests
@@ -20,6 +24,33 @@ HYPE_PATTERNS = re.compile(
 
 def log(msg: str):
     print(msg, flush=True)
+
+
+def preload_cuda_libs():
+    dirs = set()
+    roots = list(site.getsitepackages()) + [p for p in sys.path if "packages" in p]
+    for root in roots:
+        if os.path.isdir(root):
+            for d in glob.glob(os.path.join(root, "nvidia", "*", "lib")):
+                if os.path.isdir(d):
+                    dirs.add(d)
+
+    priority = [
+        "libcublasLt.so.12",
+        "libcublas.so.12",
+        "libcudnn.so.9",
+        "libcudnn_ops.so.9",
+        "libcudnn_cnn.so.9",
+    ]
+    for lib_name in priority:
+        for d in sorted(dirs):
+            path = os.path.join(d, lib_name)
+            if os.path.exists(path):
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+                break
 
 
 def extract_vod_id(vod_url: str) -> str:
@@ -243,10 +274,10 @@ def analyze_hype(audio_path: str, chat_path: str, out_path: str, window_sec: int
 
 
 def transcribe_audio(audio_path: str, out_path: str):
-    log("🎙️ جاري تجهيز الصوت وتحميل موديل Faster-Whisper (large-v3-turbo)...")
-    log("   ⏳ أول مرة بس بيحمّل الموديل (~1.6 GB)، بياخذ حوالي دقيقة...")
+    log("🎙️ جاري تجهيز الصوت ومكتبات CUDA وتحميل موديل Faster-Whisper (large-v3-turbo)...")
     t0 = time.time()
 
+    preload_cuda_libs()
     audio_array = load_audio_ffmpeg(audio_path, sr=16000)
     total_dur = len(audio_array) / 16000.0
     model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
