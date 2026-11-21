@@ -299,7 +299,6 @@ def select_clips(
     if memory_ctx:
         log("🧠 تم تحميل ذاكرة ذوقك وقواعد التقييم السابقة بنجاح!")
 
-    # تقسيم البثوث الطويلة تلقائياً لفصول 35 دقيقة مع تداخل دقيقتين عشان ما تنقص سالفة على الحد
     if duration <= 2700:
         windows = [(0.0, duration)]
     else:
@@ -374,7 +373,6 @@ def select_clips(
         if idx < len(windows):
             time.sleep(2)
 
-    # ترتيب اللقطات زمنياً حسب ظهورها في البث
     valid_clips.sort(key=lambda x: x["start"])
     return valid_clips
 
@@ -396,12 +394,6 @@ def generate_clip_srt(
     clip_end: float,
     out_srt: str,
 ) -> tuple:
-    """
-    توليد سبتايتل ديناميكي يتكيّف تلقائياً مع سرعة كلام الستريمر:
-    - كلام سريع / توتر / صراخ (>= 3.0 كلمة/ث): 1-2 كلمة بسرعة عالية
-    - كلام متوسط (2.1 - 3.0 كلمة/ث): 3-4 كلمات متوازنة
-    - كلام هادي / سالفة بطيئة (< 2.1 كلمة/ث): جملة كاملة مريحة (حتى 6 كلمات)
-    """
     clip_dur = clip_end - clip_start
     words = []
 
@@ -454,15 +446,11 @@ def generate_clip_srt(
         wps = _compute_local_wps(words, i)
         wps_samples.append(wps)
 
-        # تحديد نظام العرض اللحظي حسب سرعة كلامها
         if wps >= 3.0:
-            # سريع / متوتر / حماس -> كلمتين كلمتين أو كلمة بسرعة
             max_words, max_chars, pause_thr = 2, 16, 0.28
         elif wps >= 2.1:
-            # طبيعي -> 3-4 كلمات
             max_words, max_chars, pause_thr = 4, 26, 0.40
         else:
-            # هادي / سالفة -> جملة كاملة مريحة
             max_words, max_chars, pause_thr = 6, 42, 0.58
 
         if buf:
@@ -476,3 +464,165 @@ def generate_clip_srt(
         if tok.endswith(("؟", "!", ".", "?")):
             flush()
         elif tok.endswith("،") and len(buf) >= 2:
+            flush()
+    flush()
+
+    srt_blocks = []
+    for idx, (st, en, text) in enumerate(entries, start=1):
+        srt_blocks.append(f"{idx}\n{sec_to_srt_time(st)} --> {sec_to_srt_time(en)}\n{text}")
+
+    with open(out_srt, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(srt_blocks) + ("\n" if srt_blocks else ""))
+
+    avg_wps = round(sum(wps_samples) / len(wps_samples), 2) if wps_samples else 0.0
+    return len(entries), avg_wps
+
+
+def resolve_stream_urls(vod_url: str) -> list:
+    log("🔗 جاري استخراج رابط البث المباشر للقص السريع...")
+    cmd = [
+        "yt-dlp",
+        "-f", "best[height<=1080]/bestvideo[height<=1080]+bestaudio/best",
+        "-g",
+        "--no-playlist",
+        "--no-warnings",
+        vod_url,
+    ]
+    out = subprocess.check_output(cmd, text=True, timeout=60).strip()
+    urls = [line.strip() for line in out.splitlines() if line.strip()]
+    if not urls:
+        raise RuntimeError("تعذر استخراج رابط البث من تويتش")
+    return urls
+
+
+def cut_clip_video(stream_urls: list, start: float, end: float, out_mp4: str):
+    duration = max(1.0, end - start)
+    local_tmp = os.path.join("/tmp", os.path.basename(out_mp4))
+    if os.path.exists(local_tmp):
+        os.remove(local_tmp)
+
+    input_args = []
+    for u in stream_urls[:2]:
+        input_args += ["-ss", f"{start:.2f}", "-i", u]
+
+    encoders = [
+        ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21"],
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"],
+    ]
+
+    last_err = ""
+    success = False
+    for enc in encoders:
+        cmd = (
+            ["ffmpeg", "-y", "-nostdin", "-v", "error"]
+            + input_args
+            + ["-t", f"{duration:.2f}"]
+            + enc
+            + ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", local_tmp]
+        )
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
+        if res.returncode == 0 and os.path.exists(local_tmp) and os.path.getsize(local_tmp) > 10_000:
+            success = True
+            break
+        last_err = res.stderr.strip().splitlines()[-1] if res.stderr.strip() else f"exit code {res.returncode}"
+
+    if not success:
+        raise RuntimeError(f"فشل FFmpeg أثناء القص: {last_err}")
+
+    if os.path.exists(out_mp4):
+        os.remove(out_mp4)
+    shutil.copy2(local_tmp, out_mp4)
+    os.remove(local_tmp)
+
+
+def _cleanup_broken_parts(clips_dir: str):
+    for fname in os.listdir(clips_dir):
+        if fname.endswith(".part"):
+            try:
+                os.remove(os.path.join(clips_dir, fname))
+            except OSError:
+                pass
+
+
+def run_stage3(
+    vod_dir: str,
+    drive_root: str,
+    api_key: str,
+    extra_clips: bool = False,
+):
+    meta_path = os.path.join(vod_dir, "meta.json")
+    transcript_path = os.path.join(vod_dir, "transcript.json")
+    manifest_path = os.path.join(vod_dir, "clips_manifest.json")
+    clips_dir = os.path.join(vod_dir, "clips")
+    os.makedirs(clips_dir, exist_ok=True)
+    _cleanup_broken_parts(clips_dir)
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        transcript = json.load(f)
+
+    vod_url = meta["vod_url"]
+
+    existing_clips = []
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            existing_clips = json.load(f)
+
+    if existing_clips and not extra_clips:
+        log(f"ℹ️ يوجد بالفعل {len(existing_clips)} لقطة جاهزة لهذا البث.")
+        log("   إذا تبي لقطات إضافية من نفس البث، فعّل خيار EXTRA_CLIPS وشغّل الخلية.")
+        return existing_clips
+
+    new_clips = select_clips(
+        api_key=api_key,
+        vod_dir=vod_dir,
+        drive_root=drive_root,
+        existing_clips=existing_clips,
+    )
+
+    if not new_clips:
+        log("⚠️ ما لقى الذكاء الاصطناعي لقطات جديدة تستاهل القص.")
+        return existing_clips
+
+    stream_urls = resolve_stream_urls(vod_url)
+    start_index = len(existing_clips) + 1
+    log(f"\n🎬 تم اختيار {len(new_clips)} لقطة! جاري القصّ السريع وتوليد ملفات الـ .srt الديناميكية...\n")
+
+    for offset, clip in enumerate(new_clips):
+        clip_num = start_index + offset
+        safe_title = sanitize_filename(clip["title"])
+        base_name = f"clip_{clip_num:02d}_{safe_title}"
+        mp4_path = os.path.join(clips_dir, f"{base_name}.mp4")
+        srt_path = os.path.join(clips_dir, f"{base_name}.srt")
+
+        log(
+            f"✂️ [{clip_num:02d}] {clip['title']} "
+            f"({sec_to_hms(clip['start'])} → {sec_to_hms(clip['end'])} | {clip['duration']}ث | تقييم {clip['virality_score']}/10)"
+        )
+        log(f"    💡 السبب: {clip['reason']}")
+
+        t0 = time.time()
+        try:
+            cut_clip_video(stream_urls, clip["start"], clip["end"], mp4_path)
+            sub_count, avg_wps = generate_clip_srt(transcript, clip["start"], clip["end"], srt_path)
+            size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+            clip["id"] = clip_num
+            clip["video_path"] = mp4_path
+            clip["srt_path"] = srt_path
+            clip["avg_wps"] = avg_wps
+            existing_clips.append(clip)
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(existing_clips, f, ensure_ascii=False, indent=2)
+            log(
+                f"    ✅ جاهز خلال {time.time() - t0:.1f}ث! ({size_mb:.1f} MB | "
+                f"سبتايتل {sub_count} سطر | سرعة الكلام {avg_wps} كلمة/ث)\n"
+            )
+        except Exception as e:
+            log(f"    ❌ فشل قص اللقطة رقم {clip_num}: {e}\n")
+
+    log(f"🎉 خلصنا! كل اللقطات + ملفات الـ .srt محفوظة داخل:\n   {clips_dir}")
+    return existing_clips
+
+
+# === END OF stage3_clipper.py ===
