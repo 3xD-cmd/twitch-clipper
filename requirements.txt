@@ -1,9 +1,0 @@
-yt-dlp
-faster-whisper>=1.1.0
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
-google-genai>=1.0.0
-pydantic>=2.0
-requests
-numpy
-gradio>=5.0
