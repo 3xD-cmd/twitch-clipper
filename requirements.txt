@@ -1,0 +1,24 @@
+# TwitchClipper v3 requirements (Google Colab, Python 3.12 / 3.13)
+# Colab already ships torch and transformers (used by the optional AST audio tagger in Stage 2),
+# so they are not listed here. FFmpeg and ffprobe come from the Colab image.
+
+# Twitch VOD audio and stream URLs (kept unpinned: Twitch changes often, newest is safest)
+yt-dlp
+
+# Stage 2 transcription on the T4 (CUDA 12 runtime libraries loaded by setup_tools.py)
+faster-whisper>=1.1.0
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# Gemini (open above 1.0: the gateway checks VideoMetadata and MediaResolution at runtime)
+google-genai>=1.0.0
+
+# Data and networking
+pydantic>=2.0
+requests
+numpy
+
+# Studio: Gradio 6 custom HTML components power the timeline editor
+gradio>=6.0,<7
+
+# === END OF requirements.txt ===
